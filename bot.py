@@ -3,6 +3,8 @@ import re
 import uuid
 import asyncio
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -280,8 +282,30 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         PENDING_DOWNLOADS.pop(req_id, None)
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    """Simple HTTP healthcheck handler for Render keep-alive."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Social Downloader Bot is running healthy!")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_health_server():
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"Health server listening on port {port}")
+    server.serve_forever()
+
+
 def main():
     """Start the Telegram bot."""
+    # Start background health server for Render keep-alive
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     token = BOT_TOKEN
     if not token or token == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
         print("=" * 60)
