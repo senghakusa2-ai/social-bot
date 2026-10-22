@@ -1,0 +1,19 @@
+# Virtual environment & Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Build outputs & executables
+build/
+dist/
+*.exe
+*.apk
+*.pkg
+*.spec
+*.log
+
+# Media downloads
+downloads/
+bot_downloads/
