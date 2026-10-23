@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import uuid
 import html
 import asyncio
@@ -9,6 +10,14 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Dict, Any, Optional, List
+
+# Ensure UTF-8 output across all operating systems and Windows consoles
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 from dotenv import load_dotenv
 from telegram import (
@@ -359,17 +368,49 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text("⚡ The bot now downloads automatically in best quality! Just send the link.")
 
 
+BOT_STATUS = {
+    "status": "Starting up",
+    "message": "Initializing Social Downloader Bot...",
+}
+
+
 class HealthHandler(BaseHTTPRequestHandler):
-    """Simple HTTP healthcheck handler for Render keep-alive."""
+    """HTTP healthcheck handler for Render keep-alive and diagnostics."""
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
+        self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Social Downloader Bot is running healthy!")
+        status_text = BOT_STATUS.get("status", "Running")
+        msg_text = BOT_STATUS.get("message", "Service active")
+        html_doc = (
+            "<!DOCTYPE html>"
+            "<html>"
+            "<head>"
+            "<meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<title>Social Downloader Bot</title>"
+            "<style>"
+            "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }"
+            ".card { background: #1e293b; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); text-align: center; max-width: 480px; width: 90%; }"
+            "h1 { font-size: 1.5rem; margin-bottom: 0.5rem; color: #38bdf8; }"
+            ".badge { display: inline-block; padding: 6px 14px; border-radius: 20px; font-weight: bold; background: #0284c7; color: white; margin: 12px 0; }"
+            "p { line-height: 1.5; color: #94a3b8; font-size: 0.95rem; }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='card'>"
+            "<h1>⚡ Social Downloader Bot</h1>"
+            f"<div class='badge'>{html.escape(status_text)}</div>"
+            f"<p>{html.escape(msg_text)}</p>"
+            "</div>"
+            "</body>"
+            "</html>"
+        )
+        self.wfile.write(html_doc.encode("utf-8"))
 
     def do_HEAD(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
+        self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
 
     def log_message(self, format, *args):
@@ -392,30 +433,54 @@ def main():
     threading.Thread(target=run_health_server, daemon=True).start()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or BOT_TOKEN
+    is_cloud = bool(os.getenv("PORT") or os.getenv("RENDER"))
+
     if not token or token == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        print("=" * 60)
-        print("⚠️  TELEGRAM_BOT_TOKEN NOT FOUND!")
-        print("Please configure your Telegram Bot Token in the .env file.")
-        print("=" * 60)
-        try:
-            token = input("Or enter your Telegram Bot Token now: ").strip()
-        except EOFError:
-            token = ""
-        if not token:
-            print("❌ No token provided. Exiting.")
-            return
+        BOT_STATUS["status"] = "Action Required: Missing Token"
+        BOT_STATUS["message"] = "Please configure TELEGRAM_BOT_TOKEN in Render Dashboard > Environment."
+        logger.error("=" * 60)
+        logger.error("⚠️ TELEGRAM_BOT_TOKEN NOT FOUND!")
+        logger.error("Please configure your Telegram Bot Token in Render Environment or .env file.")
+        logger.error("=" * 60)
 
-    print("🚀 Starting Social Downloader Telegram Bot (@MultidownloadHak_bot)...")
-    app = Application.builder().token(token).build()
+        if is_cloud:
+            import time
+            while not token or token == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
+                time.sleep(10)
+                load_dotenv(override=True)
+                token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        else:
+            try:
+                token = input("Or enter your Telegram Bot Token now: ").strip()
+            except EOFError:
+                token = ""
+            if not token:
+                logger.error("❌ No token provided. Exiting.")
+                return
 
-    # Handlers
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(handle_callback_query))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url_message))
+    try:
+        print("🚀 Starting Social Downloader Telegram Bot (@MultidownloadHak_bot)...")
+        app = Application.builder().token(token).build()
 
-    print("🤖 Bot is running! Press Ctrl+C to stop.")
-    app.run_polling()
+        # Handlers
+        app.add_handler(CommandHandler("start", start_command))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CallbackQueryHandler(handle_callback_query))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url_message))
+
+        BOT_STATUS["status"] = "Online & Connected"
+        BOT_STATUS["message"] = "Social Downloader Bot is running healthy and listening for Telegram messages!"
+
+        print("🤖 Bot is running! Press Ctrl+C to stop.")
+        app.run_polling()
+    except Exception as run_err:
+        BOT_STATUS["status"] = "Bot Error"
+        BOT_STATUS["message"] = f"Telegram error: {run_err}"
+        logger.error(f"Telegram Bot error: {run_err}", exc_info=True)
+        if is_cloud:
+            import time
+            while True:
+                time.sleep(60)
 
 
 if __name__ == "__main__":
