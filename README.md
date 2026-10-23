@@ -77,8 +77,8 @@ You can also run your downloader as a full-featured Telegram Bot!
    ```env
    TELEGRAM_BOT_TOKEN=your_token_here
    ```
-3. Run the bot by double clicking `START_BOT.bat` (or shortcut `START_TELEGRAM_BOT.bat` on your Desktop), or via terminal:
+3. Run the bot by double clicking `START_BOT.bat`, or via terminal:
    ```powershell
    python bot.py
    ```
-4. In Telegram, send any media link (TikTok, Instagram Reel, YouTube Shorts, X/Twitter, etc.) and pick **Best Video**, **720p**, or **Audio Only (MP3)**!
+4. In Telegram, send any media link (TikTok, Instagram Reels & Carousels, YouTube, X/Twitter, etc.). The bot will automatically download the best quality video and all pictures/videos from the post!
