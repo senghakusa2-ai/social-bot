@@ -86,14 +86,17 @@ def format_duration(seconds: Optional[int]) -> str:
     return f"{mins}:{secs:02d}"
 
 
-def get_video_duration(video_path: str) -> Optional[float]:
-    """Get video duration using ffprobe."""
+def get_video_metadata(video_path: str) -> Dict[str, Any]:
+    """Get video duration, width, height, and codec using ffprobe."""
+    meta: Dict[str, Any] = {"duration": None, "width": None, "height": None, "codec": None}
     if not FFPROBE_PATH or not os.path.exists(video_path):
-        return None
+        return meta
     try:
         cmd = [
             FFPROBE_PATH,
             "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,codec_name",
             "-show_entries", "format=duration",
             "-of", "json",
             video_path,
@@ -101,12 +104,95 @@ def get_video_duration(video_path: str) -> Optional[float]:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if res.returncode == 0:
             data = json.loads(res.stdout)
+            # Duration from format
             duration = data.get("format", {}).get("duration")
             if duration:
-                return float(duration)
+                meta["duration"] = float(duration)
+            # Width, height, codec from first video stream
+            streams = data.get("streams", [])
+            if streams:
+                meta["width"] = streams[0].get("width")
+                meta["height"] = streams[0].get("height")
+                meta["codec"] = streams[0].get("codec_name")
     except Exception as e:
-        logger.debug(f"ffprobe duration check failed: {e}")
+        logger.debug(f"ffprobe metadata check failed: {e}")
+    return meta
+
+
+def get_video_duration(video_path: str) -> Optional[float]:
+    """Get video duration using ffprobe (convenience wrapper)."""
+    return get_video_metadata(video_path).get("duration")
+
+
+def generate_thumbnail(video_path: str) -> Optional[str]:
+    """Generate a JPEG thumbnail from a video at the 1-second mark using ffmpeg."""
+    if not FFMPEG_PATH or not os.path.exists(video_path):
+        return None
+    thumb_path = os.path.splitext(video_path)[0] + "_thumb.jpg"
+    try:
+        cmd = [
+            FFMPEG_PATH,
+            "-y",
+            "-i", video_path,
+            "-ss", "1",
+            "-vframes", "1",
+            "-vf", "scale='min(320,iw)':-2",
+            "-q:v", "5",
+            thumb_path,
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=15, check=True)
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            return thumb_path
+    except Exception as e:
+        logger.debug(f"Thumbnail generation failed: {e}")
     return None
+
+
+def ensure_h264_for_telegram(video_path: str) -> str:
+    """
+    If a video is NOT already H.264 (e.g. VP9, AV1, HEVC), re-encode it to H.264
+    so Telegram passes it through without server-side re-encoding / quality loss.
+    Returns the path to the H.264 file (may be the same if already H.264).
+    """
+    meta = get_video_metadata(video_path)
+    codec = (meta.get("codec") or "").lower()
+
+    # Already H.264 — no re-encode needed
+    if codec in ("h264", "avc", "avc1"):
+        return video_path
+
+    if not FFMPEG_PATH:
+        return video_path
+
+    base, ext = os.path.splitext(video_path)
+    h264_path = f"{base}_h264.mp4"
+
+    logger.info(f"Re-encoding {os.path.basename(video_path)} from {codec} → H.264 for Telegram compatibility")
+
+    try:
+        cmd = [
+            FFMPEG_PATH,
+            "-y",
+            "-i", video_path,
+            "-c:v", "libx264",
+            "-crf", "18",        # Near-lossless quality
+            "-preset", "medium",
+            "-profile:v", "high",
+            "-level:v", "4.2",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ac", "2",
+            "-movflags", "+faststart",
+            h264_path,
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=600, check=True)
+        if os.path.exists(h264_path) and os.path.getsize(h264_path) > 0:
+            return h264_path
+    except Exception as e:
+        logger.warning(f"H.264 re-encode failed: {e}")
+
+    return video_path
 
 
 def optimize_video_for_telegram(video_path: str, target_max_mb: float = 48.5) -> Optional[str]:
@@ -341,6 +427,17 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             p = item["path"]
             sz_mb = item["size_mb"]
 
+            # For all videos: ensure H.264 codec so Telegram doesn't re-encode
+            if item["type"] == "video":
+                h264_p = await loop.run_in_executor(
+                    None, lambda path=p: ensure_h264_for_telegram(path)
+                )
+                if h264_p != p:
+                    item["path"] = h264_p
+                    item["size_mb"] = os.path.getsize(h264_p) / (1024 * 1024)
+                    p = h264_p
+                    sz_mb = item["size_mb"]
+
             if item["type"] == "video" and sz_mb > TELEGRAM_MAX_MB:
                 # Video is 4K or large HD exceeding Telegram limit:
                 # 1. Save a pristine copy to permanent local storage
@@ -430,19 +527,48 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         write_timeout=120,
                     )
             else:
-                # *** SEND AS DOCUMENT to preserve original HD/4K quality ***
-                # Telegram's send_video re-encodes the video on their servers
-                # which massively degrades quality. send_document keeps the raw file intact.
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-                with open(item["path"], "rb") as f:
-                    await context.bot.send_document(
+                # *** HIGH QUALITY INLINE VIDEO ***
+                # Ensure H.264 codec so Telegram does NOT re-encode on their servers.
+                # Then use send_video with thumbnail + metadata for full inline HD playback.
+                vid_path = await loop.run_in_executor(
+                    None, lambda p=item["path"]: ensure_h264_for_telegram(p)
+                )
+                vid_meta = await loop.run_in_executor(
+                    None, lambda p=vid_path: get_video_metadata(p)
+                )
+                thumb_path = await loop.run_in_executor(
+                    None, lambda p=vid_path: generate_thumbnail(p)
+                )
+
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+                thumb_file = None
+                try:
+                    vid_file = open(vid_path, "rb")
+                    if thumb_path:
+                        thumb_file = open(thumb_path, "rb")
+                    await context.bot.send_video(
                         chat_id=chat_id,
-                        document=f,
+                        video=vid_file,
                         caption=caption,
                         parse_mode=ParseMode.HTML,
+                        duration=int(vid_meta["duration"]) if vid_meta.get("duration") else None,
+                        width=vid_meta.get("width"),
+                        height=vid_meta.get("height"),
+                        thumbnail=thumb_file,
+                        supports_streaming=True,
                         read_timeout=300,
                         write_timeout=300,
                     )
+                finally:
+                    vid_file.close()
+                    if thumb_file:
+                        thumb_file.close()
+                    # Clean up thumbnail
+                    if thumb_path:
+                        try:
+                            os.remove(thumb_path)
+                        except Exception:
+                            pass
             sent_count += 1
 
         # 2) If multiple photos/videos: send photos in media group, videos individually as documents
@@ -500,20 +626,50 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             except Exception:
                                 pass
 
-            # Send each video as document to preserve full HD/4K quality
+            # Send each video as inline video with H.264 for full HD quality playback
             for idx, item in enumerate(video_items):
                 try:
                     caption = base_caption if (idx == 0 and not photo_items) else None
-                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-                    with open(item["path"], "rb") as f:
-                        await context.bot.send_document(
+
+                    # Ensure H.264 codec for Telegram compatibility
+                    vid_path = await loop.run_in_executor(
+                        None, lambda p=item["path"]: ensure_h264_for_telegram(p)
+                    )
+                    vid_meta = await loop.run_in_executor(
+                        None, lambda p=vid_path: get_video_metadata(p)
+                    )
+                    thumb_path = await loop.run_in_executor(
+                        None, lambda p=vid_path: generate_thumbnail(p)
+                    )
+
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+                    thumb_file = None
+                    try:
+                        vid_file = open(vid_path, "rb")
+                        if thumb_path:
+                            thumb_file = open(thumb_path, "rb")
+                        await context.bot.send_video(
                             chat_id=chat_id,
-                            document=f,
+                            video=vid_file,
                             caption=caption,
                             parse_mode=ParseMode.HTML if caption else None,
+                            duration=int(vid_meta["duration"]) if vid_meta.get("duration") else None,
+                            width=vid_meta.get("width"),
+                            height=vid_meta.get("height"),
+                            thumbnail=thumb_file,
+                            supports_streaming=True,
                             read_timeout=300,
                             write_timeout=300,
                         )
+                    finally:
+                        vid_file.close()
+                        if thumb_file:
+                            thumb_file.close()
+                        if thumb_path:
+                            try:
+                                os.remove(thumb_path)
+                            except Exception:
+                                pass
                     sent_count += 1
                 except Exception as vid_err:
                     logger.error(f"Failed to send video {item['filename']}: {vid_err}")

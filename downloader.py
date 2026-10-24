@@ -300,15 +300,15 @@ class SocialDownloader:
             "outtmpl": output_template,
             # Download the absolute best video+audio streams (no height cap)
             "format": "bestvideo*+bestaudio/best",
-            # Sort: prefer highest resolution, then highest bitrate, then biggest filesize
-            # Do NOT prefer h264 — VP9/AV1 give better quality at the same bitrate
+            # Sort: prefer highest resolution, then H.264 codec (Telegram-native, zero re-encoding),
+            # then highest bitrate, then biggest filesize
             "format_sort": [
                 "res",
+                "vcodec:h264",
                 "br",
                 "size",
                 "fps",
-                "vcodec:vp9.2",
-                "acodec:opus",
+                "acodec:aac",
             ],
             "format_sort_force": True,
             "merge_output_format": "mp4",

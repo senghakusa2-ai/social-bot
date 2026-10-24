@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: social-bot-1pro
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: PORT
+        value: "8080"
