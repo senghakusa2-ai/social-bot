@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import shutil
 import uuid
@@ -7,13 +8,16 @@ import requests
 import logging
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any, List
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 try:
     import static_ffmpeg
     static_ffmpeg.add_paths()
     FFMPEG_PATH = shutil.which("ffmpeg")
+    FFPROBE_PATH = shutil.which("ffprobe")
 except Exception:
     FFMPEG_PATH = shutil.which("ffmpeg")
+    FFPROBE_PATH = shutil.which("ffprobe")
 
 import yt_dlp
 
@@ -23,7 +27,7 @@ DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/128.0.0.0 Safari/537.36"
+        "Chrome/130.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
     "Sec-Fetch-Mode": "navigate",
@@ -31,37 +35,166 @@ DEFAULT_HEADERS = {
 
 
 class SocialDownloader:
-    def __init__(self, output_dir: str = "downloads", browser_cookies: Optional[str] = None):
+    def __init__(
+        self,
+        output_dir: str = "downloads",
+        cookies_file: Optional[str] = None,
+        browser_cookies: Optional[str] = None,
+    ):
         """
         :param output_dir: Directory where downloaded files are saved
-        :param browser_cookies: Optional browser name to extract cookies from
+        :param cookies_file: Optional path to cookies.txt file
+        :param browser_cookies: Optional browser name to extract cookies from (chrome, edge, firefox, brave)
         """
         self.output_dir = Path(os.path.abspath(output_dir))
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.browser_cookies = browser_cookies if browser_cookies and browser_cookies.lower() != "none" else None
+
+        # 1. Resolve cookies file: explicitly passed, or env var, or check project root / cookies.txt
+        env_cookie = os.getenv("COOKIES_FILE")
+        candidate_cookies = [
+            cookies_file,
+            env_cookie,
+            self.output_dir.parent / "cookies.txt",
+            Path("cookies.txt"),
+            Path("cookies.dat"),
+            Path("instagram_cookies.txt"),
+            Path("fb_cookies.txt"),
+        ]
+        self.cookies_file: Optional[Path] = None
+        for c in candidate_cookies:
+            if c:
+                cp = Path(c).resolve()
+                if cp.is_file() and cp.stat().st_size > 0:
+                    self.cookies_file = cp
+                    break
+
+        # 2. Resolve browser cookies
+        env_browser = os.getenv("BROWSER_COOKIES")
+        chosen_browser = browser_cookies or env_browser
+        self.browser_cookies = (
+            chosen_browser.lower().strip()
+            if chosen_browser and chosen_browser.lower().strip() != "none"
+            else None
+        )
+
+        if self.cookies_file:
+            logger.info(f"Using cookies file: {self.cookies_file}")
+        elif self.browser_cookies:
+            logger.info(f"Using browser cookies from: {self.browser_cookies}")
+
+    def is_story_url(self, url: str) -> bool:
+        """Check if URL targets an Instagram, Facebook, or TikTok story/highlight."""
+        u = url.lower()
+        return any(
+            pattern in u
+            for pattern in [
+                "instagram.com/stories/",
+                "instagram.com/s/",
+                "instagram.com/highlights/",
+                "facebook.com/stories/",
+                "fb.com/stories/",
+                "/story.php",
+            ]
+        )
+
+    def _resolve_facebook_share(self, url: str) -> str:
+        """Resolve Facebook share URLs (/share/r/, /share/v/, /share/p/) to canonical URLs."""
+        try:
+            session = requests.Session()
+            session.headers.update(DEFAULT_HEADERS)
+            resp = session.get(url, allow_redirects=True, timeout=12)
+
+            # 1. Did it redirect to a canonical URL?
+            if any(k in resp.url for k in ["/reel/", "/videos/", "/watch", "story_fbid"]):
+                return resp.url
+
+            # 2. Check HTML canonical or og:url tags
+            html_text = resp.text
+            canon = re.search(r'<link\s+rel=["\']canonical["\']\s+href=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+            if canon:
+                c_url = canon.group(1)
+                if any(k in c_url for k in ["/reel/", "/videos/", "/watch"]):
+                    return c_url
+
+            og_match = re.search(r'<meta\s+property=["\']og:url["\']\s+content=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+            if og_match:
+                og_url = og_match.group(1)
+                if any(k in og_url for k in ["/reel/", "/videos/", "/watch"]):
+                    return og_url
+
+            # 3. Search for reel ID or video ID in page text
+            reel_match = re.search(r'["\']/reel/(\d+)["\']', html_text)
+            if reel_match:
+                return f"https://www.facebook.com/reel/{reel_match.group(1)}/"
+
+            video_match = re.search(r'["\'](?:watch/\?v=|/videos/)(\d+)["\']', html_text)
+            if video_match:
+                return f"https://www.facebook.com/watch/?v={video_match.group(1)}"
+
+            if resp.url:
+                return resp.url
+        except Exception as e:
+            logger.debug(f"Facebook share resolution exception: {e}")
+
+        return url
 
     def _clean_url(self, url: str) -> str:
-        """Resolve shortened URLs (like vt.tiktok.com, vm.tiktok.com, t.co, youtu.be, bit.ly)."""
+        """Clean and normalize URL: resolve redirects, handle FB share links, strip tracking parameters."""
         url = url.strip().strip('"').strip("'")
         if not url:
             return url
 
-        # If it's a shortened redirect URL, resolve canonical destination
-        if any(domain in url for domain in ["vt.tiktok.com", "vm.tiktok.com", "t.co", "bit.ly", "tinyurl.com", "fb.watch"]):
+        # Facebook share redirection handler
+        if "facebook.com/share/" in url:
+            url = self._resolve_facebook_share(url)
+
+        # Handle other shortened / mobile redirect URLs
+        shortened_domains = [
+            "vt.tiktok.com",
+            "vm.tiktok.com",
+            "t.co",
+            "bit.ly",
+            "tinyurl.com",
+            "fb.watch",
+            "fb.me",
+            "youtu.be",
+            "pin.it",
+        ]
+        if any(domain in url for domain in shortened_domains):
             try:
-                res = requests.head(url, headers=DEFAULT_HEADERS, allow_redirects=True, timeout=8)
-                if res.url:
-                    return res.url
+                res = requests.head(url, headers=DEFAULT_HEADERS, allow_redirects=True, timeout=10)
+                if res.url and res.url != url:
+                    url = res.url
             except Exception:
                 try:
-                    res = requests.get(url, headers=DEFAULT_HEADERS, allow_redirects=True, stream=True, timeout=8)
-                    if res.url:
-                        return res.url
+                    res = requests.get(url, headers=DEFAULT_HEADERS, allow_redirects=True, stream=True, timeout=10)
+                    if res.url and res.url != url:
+                        url = res.url
                 except Exception:
                     pass
+
+        # Strip tracking query parameters for Instagram and others, while retaining essential path
+        try:
+            parsed = urlparse(url)
+            if "instagram.com" in parsed.netloc:
+                qs = parse_qs(parsed.query)
+                # Keep only non-tracking params
+                clean_qs = {k: v for k, v in qs.items() if not k.startswith("igsh") and k not in ["utm_source", "utm_medium", "utm_campaign", "ig_rid"]}
+                new_query = urlencode(clean_qs, doseq=True)
+                url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+            elif "facebook.com" in parsed.netloc:
+                # Remove tracking tokens
+                qs = parse_qs(parsed.query)
+                clean_qs = {k: v for k, v in qs.items() if k in ["v", "id", "story_fbid"]}
+                new_query = urlencode(clean_qs, doseq=True)
+                url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+        except Exception:
+            pass
+
         return url
 
     def _get_base_opts(self) -> Dict[str, Any]:
+        """Generate base yt-dlp options configured for highest quality and resilience."""
         opts: Dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
@@ -78,7 +211,10 @@ class SocialDownloader:
         if FFMPEG_PATH:
             opts["ffmpeg_location"] = FFMPEG_PATH
 
-        if self.browser_cookies:
+        # Add cookie file if available
+        if self.cookies_file and self.cookies_file.is_file():
+            opts["cookiefile"] = str(self.cookies_file)
+        elif self.browser_cookies:
             opts["cookiesfrombrowser"] = (self.browser_cookies,)
 
         return opts
@@ -100,16 +236,12 @@ class SocialDownloader:
         progress_hook: Optional[Callable] = None,
     ) -> Dict[str, Any]:
         """
-        Automatically download media in best quality video and/or photos.
-        Can download multiple videos and pictures from a single link (carousels, playlists, albums).
-
-        :param url: URL to post, video, carousel, or playlist
-        :param req_dir: Optional destination directory for this request
-        :param max_items: Maximum items to download from playlists/carousels
-        :param progress_hook: Optional progress callback
-        :return: Dict containing title, uploader, dir, and list of downloaded files
+        Automatically download media in HIGHEST QUALITY (HD - 4K) video and/or photos.
+        Can download multiple videos and pictures from a single link (carousels, playlists, stories).
         """
         url = self._clean_url(url)
+        is_story = self.is_story_url(url)
+
         if not req_dir:
             req_dir = self.output_dir / f"req_{uuid.uuid4().hex[:10]}"
         req_dir = Path(req_dir)
@@ -142,16 +274,55 @@ class SocialDownloader:
             except Exception as tw_err:
                 logger.debug(f"TikWM check notice: {tw_err}")
 
-        # Strategy 2: Download with yt-dlp (Auto best quality video, audio, and entries)
+        # Strategy 2: Specialized Story Extraction (gallery-dl preferred for Instagram stories/highlights)
+        if is_story and "instagram.com" in url:
+            try:
+                cmd = [
+                    sys.executable, "-m", "gallery_dl",
+                    "--directory", str(req_dir),
+                    "--quiet",
+                    "--no-mtime",
+                    "--windows-filenames",
+                ]
+                if self.cookies_file and self.cookies_file.is_file():
+                    cmd.extend(["--cookies", str(self.cookies_file)])
+                elif self.browser_cookies:
+                    cmd.extend(["--cookies-from-browser", self.browser_cookies])
+                cmd.append(url)
+                subprocess.run(cmd, timeout=90, capture_output=True)
+            except Exception as story_err:
+                logger.debug(f"Story extraction via gallery-dl notice: {story_err}")
+
+        # Strategy 3: Download with yt-dlp with HIGHEST QUALITY (HD - 4K Priority)
         opts = self._get_base_opts()
         output_template = str(req_dir / "%(autonumber)02d_%(title).60s_%(id)s.%(ext)s")
         opts.update({
             "outtmpl": output_template,
+            # Prioritize 4K (2160p) -> 2K (1440p) -> Full HD (1080p) -> 720p HD
             "format": "bestvideo*+bestaudio/best",
+            "format_sort": [
+                "res:2160",
+                "res:1440",
+                "res:1080",
+                "res:720",
+                "res",
+                "fps",
+                "codec:h264",
+                "quality",
+                "size",
+                "br",
+            ],
             "merge_output_format": "mp4",
             "noplaylist": False,
             "ignoreerrors": True,
             "max_downloads": max_items,
+            "postprocessors": [{
+                "key": "FFmpegVideoRemuxer",
+                "preferedformat": "mp4",
+            }],
+            "postprocessor_args": [
+                "-movflags", "+faststart",
+            ],
         })
         if progress_hook:
             opts["progress_hooks"] = [progress_hook]
@@ -170,7 +341,7 @@ class SocialDownloader:
                             continue
                         formats = entry.get("formats") or []
                         thumbnails = entry.get("thumbnails") or []
-                        # If entry has no video stream (e.g. Instagram photo entry)
+                        # If entry has no video stream (e.g. photo post)
                         has_video = any(f.get("vcodec") and f.get("vcodec") != "none" for f in formats)
                         if not has_video and thumbnails:
                             best_thumb = thumbnails[-1].get("url")
@@ -186,7 +357,7 @@ class SocialDownloader:
         except Exception as ytdl_err:
             logger.info(f"yt-dlp download notice: {ytdl_err}")
 
-        # Strategy 3: gallery-dl fallback / complementary fetch for Instagram, Twitter, Pinterest, Reddit galleries
+        # Strategy 4: gallery-dl fallback / complementary fetch for Instagram, Twitter, Pinterest, Reddit galleries
         existing_files = [f for f in req_dir.glob("*") if f.is_file() and not f.name.endswith((".part", ".tmp", ".ytdl"))]
         is_gallery_platform = any(
             domain in url.lower() for domain in [
@@ -202,7 +373,9 @@ class SocialDownloader:
                     "--no-mtime",
                     "--windows-filenames",
                 ]
-                if self.browser_cookies:
+                if self.cookies_file and self.cookies_file.is_file():
+                    cmd.extend(["--cookies", str(self.cookies_file)])
+                elif self.browser_cookies:
                     cmd.extend(["--cookies-from-browser", self.browser_cookies])
                 cmd.append(url)
                 subprocess.run(cmd, timeout=90, capture_output=True)
@@ -253,11 +426,17 @@ class SocialDownloader:
                 "size_mb": size_bytes / (1024 * 1024),
             })
 
+        has_cookies = bool(self.cookies_file or self.browser_cookies)
+        story_missing_cookies = is_story and len(media_files) == 0 and not has_cookies
+
         return {
             "title": title,
             "uploader": uploader,
             "dir": str(req_dir),
             "files": media_files,
+            "is_story": is_story,
+            "has_cookies": has_cookies,
+            "story_missing_cookies": story_missing_cookies,
         }
 
     def download(
@@ -296,14 +475,17 @@ class SocialDownloader:
             q = quality.lower().split()[0]
             if q == "4k":
                 opts["format"] = "bestvideo*[height<=2160]+bestaudio/best[height<=2160]/bestvideo*+bestaudio/best"
+                opts["format_sort"] = ["res:2160", "res:1440", "res:1080", "res", "fps"]
             elif q == "1080p":
                 opts["format"] = "bestvideo*[height<=1080]+bestaudio/best[height<=1080]/bestvideo*+bestaudio/best"
+                opts["format_sort"] = ["res:1080", "res:720", "res", "fps"]
             elif q == "720p":
                 opts["format"] = "bestvideo*[height<=720]+bestaudio/best[height<=720]/bestvideo*+bestaudio/best"
             elif q == "480p":
                 opts["format"] = "bestvideo*[height<=480]+bestaudio/best[height<=480]/bestvideo*+bestaudio/best"
             else:
                 opts["format"] = "bestvideo*+bestaudio/best"
+                opts["format_sort"] = ["res:2160", "res:1440", "res:1080", "res", "fps"]
 
             opts["merge_output_format"] = "mp4"
 
@@ -312,11 +494,9 @@ class SocialDownloader:
             if not info:
                 raise Exception("Could not extract media info from this link.")
             
-            # If playlist/entries
             if "entries" in info and info["entries"]:
                 info = info["entries"][0]
 
-            # Check if yt-dlp recorded the final downloaded filepath
             if "requested_downloads" in info and info["requested_downloads"]:
                 for item in reversed(info["requested_downloads"]):
                     filepath = item.get("filepath") or item.get("_filename")
@@ -331,7 +511,6 @@ class SocialDownloader:
             if os.path.exists(filename):
                 return filename
 
-            # Fallback search in output directory if file extension changed
             base_name = os.path.splitext(os.path.basename(filename))[0]
             for candidate in self.output_dir.glob(f"{base_name}*"):
                 if candidate.is_file():

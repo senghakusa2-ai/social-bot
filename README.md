@@ -70,15 +70,20 @@ python main.py "https://..." -o "C:\MyVideos"
 
 ## 🤖 Telegram Bot Mode
 
-You can also run your downloader as a full-featured Telegram Bot!
+You can run your downloader as a full-featured Telegram Bot!
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and copy your API Token.
 2. Edit `.env` in this directory:
    ```env
    TELEGRAM_BOT_TOKEN=your_token_here
+   COOKIES_FILE=cookies.txt
    ```
-3. Run the bot by double clicking `START_BOT.bat`, or via terminal:
-   ```powershell
-   python bot.py
-   ```
-4. In Telegram, send any media link (TikTok, Instagram Reels & Carousels, YouTube, X/Twitter, etc.). The bot will automatically download the best quality video and all pictures/videos from the post!
+3. Run the bot by double clicking `START_BOT.bat`, or via desktop shortcut `START_TELEGRAM_BOT.bat`.
+4. In Telegram, send any media link (TikTok, Instagram Reels & Carousels, YouTube, X/Twitter, Facebook, etc.). The bot automatically downloads in highest quality (HD - 4K)!
+
+### 📸 Downloading Instagram & Facebook Stories in Bot
+Instagram and Facebook require an active login session to view Stories.
+1. In your browser (Chrome/Edge/Firefox), install the extension **"Get cookies.txt LOCALLY"**.
+2. Log into Instagram and Facebook.
+3. Export cookies and save the file as `cookies.txt` directly inside `C:\Users\Lenovo\social_downloader\cookies.txt`.
+4. Restart the bot! The bot will automatically detect `cookies.txt` and can now download any Story link seamlessly.

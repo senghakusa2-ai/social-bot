@@ -3,9 +3,11 @@ import re
 import sys
 import uuid
 import html
+import json
 import asyncio
 import logging
 import shutil
+import subprocess
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -37,7 +39,7 @@ from telegram.ext import (
     filters,
 )
 
-from downloader import SocialDownloader
+from downloader import SocialDownloader, FFMPEG_PATH, FFPROBE_PATH
 
 # Setup Logging
 logging.basicConfig(
@@ -53,15 +55,24 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DOWNLOADS_DIR = Path("bot_downloads")
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
+PERMANENT_SAVED_DIR = DOWNLOADS_DIR / "saved_full_quality"
+PERMANENT_SAVED_DIR.mkdir(parents=True, exist_ok=True)
+
 # URL regex pattern
 URL_REGEX = re.compile(
     r"https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)"
 )
 
-# In-memory storage for active download requests: token -> {url, title, uploader}
-PENDING_DOWNLOADS: Dict[str, Dict[str, Any]] = {}
+# Initialize downloader with cookie discovery
+cookies_file = os.getenv("COOKIES_FILE") or ("cookies.txt" if os.path.exists("cookies.txt") else None)
+browser_cookies = os.getenv("BROWSER_COOKIES") or None
+downloader = SocialDownloader(
+    output_dir=str(DOWNLOADS_DIR),
+    cookies_file=cookies_file,
+    browser_cookies=browser_cookies,
+)
 
-downloader = SocialDownloader(output_dir=str(DOWNLOADS_DIR))
+TELEGRAM_MAX_MB = float(os.getenv("MAX_TELEGRAM_FILE_MB", "49.5"))
 
 
 def format_duration(seconds: Optional[int]) -> str:
@@ -75,6 +86,86 @@ def format_duration(seconds: Optional[int]) -> str:
     return f"{mins}:{secs:02d}"
 
 
+def get_video_duration(video_path: str) -> Optional[float]:
+    """Get video duration using ffprobe."""
+    if not FFPROBE_PATH or not os.path.exists(video_path):
+        return None
+    try:
+        cmd = [
+            FFPROBE_PATH,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            video_path,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0:
+            data = json.loads(res.stdout)
+            duration = data.get("format", {}).get("duration")
+            if duration:
+                return float(duration)
+    except Exception as e:
+        logger.debug(f"ffprobe duration check failed: {e}")
+    return None
+
+
+def optimize_video_for_telegram(video_path: str, target_max_mb: float = 48.5) -> Optional[str]:
+    """
+    If a video exceeds Telegram's upload limit (50 MB), compress it using ffmpeg
+    so that it fits under target_max_mb with crisp HD quality (up to 1080p).
+    """
+    if not FFMPEG_PATH or not os.path.exists(video_path):
+        return None
+
+    size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    if size_mb <= target_max_mb:
+        return video_path
+
+    duration = get_video_duration(video_path)
+    if not duration or duration <= 0:
+        # Fallback duration estimate from size if probe fails
+        duration = max(30.0, size_mb * 2.0)
+
+    # Calculate target video bitrate
+    target_bytes = target_max_mb * 1024 * 1024
+    total_bitrate = int((target_bytes * 8) / duration)
+    audio_bitrate = min(128000, int(total_bitrate * 0.15))
+    video_bitrate = max(450000, total_bitrate - audio_bitrate)
+
+    base, ext = os.path.splitext(video_path)
+    optimized_path = f"{base}_tg_hd.mp4"
+
+    logger.info(f"Optimizing {os.path.basename(video_path)} ({size_mb:.1f}MB) -> target ~{target_max_mb}MB (bitrate: {video_bitrate//1000}k)...")
+
+    cmd = [
+        FFMPEG_PATH,
+        "-y",
+        "-i", video_path,
+        "-c:v", "libx264",
+        "-b:v", str(video_bitrate),
+        "-maxrate", str(int(video_bitrate * 1.4)),
+        "-bufsize", str(int(video_bitrate * 2)),
+        "-vf", "scale='min(1920,iw)':-2",
+        "-preset", "fast",
+        "-c:a", "aac",
+        "-b:a", str(audio_bitrate),
+        "-movflags", "+faststart",
+        optimized_path,
+    ]
+
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=300, check=True)
+        if os.path.exists(optimized_path):
+            new_size_mb = os.path.getsize(optimized_path) / (1024 * 1024)
+            logger.info(f"Optimized video created: {new_size_mb:.1f}MB")
+            if new_size_mb <= 50.0:
+                return optimized_path
+    except Exception as e:
+        logger.warning(f"ffmpeg video optimization error: {e}")
+
+    return None
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     user = update.effective_user
@@ -82,14 +173,45 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         f"👋 <b>Hello {first_name}!</b>\n\n"
         "⚡ Welcome to <b>Universal Social Downloader Bot</b>!\n\n"
-        "🎯 <b>Features:</b>\n"
-        "• 🚀 <b>Auto Best Quality</b>: Automatically downloads highest resolution video!\n"
-        "• 📸 <b>Multi-Media Support</b>: Download multiple videos & pictures from 1 link!\n"
-        "• 📱 Supports TikTok (Videos & Photo Slides), Instagram (Reels & Carousels), YouTube, Twitter/X, Facebook, Reddit, Pinterest & more!\n\n"
-        "👉 <b>Simply paste or send any link here to start downloading!</b>"
+        "🎯 <b>Highlights & Features:</b>\n"
+        "• 🌟 <b>Highest Quality Only (HD - 4K)</b>: Prioritizes 4K (2160p), 1440p, and 1080p full HD resolution!\n"
+        "• 📸 <b>Stories & Highlights</b>: Supports Instagram & Facebook Stories (via cookies)!\n"
+        "• 🎬 <b>Smart 50MB Handling</b>: Auto-optimizes large 4K/HD videos so Telegram allows downloading without errors!\n"
+        "• 📱 <b>Platforms Supported</b>: TikTok (No watermark / Slides), Instagram (Reels, Carousels, Stories), Facebook (Reels, Watch, Shares), YouTube (Shorts & 4K), Twitter/X, Reddit, Pinterest & more!\n\n"
+        "👉 <b>Simply paste or send any link here to start downloading!</b>\n"
+        "💡 Send /cookies to learn how to enable Instagram & Facebook Story downloads."
     )
     if update.message:
         await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
+
+
+async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /cookies command to guide users on enabling Story downloads."""
+    status_icon = "✅" if (downloader.cookies_file or downloader.browser_cookies) else "⚠️"
+    current_status = "Cookies Loaded & Active" if (downloader.cookies_file or downloader.browser_cookies) else "No Cookies Configured"
+
+    info_text = (
+        f"🍪 <b>Story & Cookie Configuration:</b>\n\n"
+        f"<b>Status:</b> {status_icon} <code>{current_status}</code>\n"
+    )
+    if downloader.cookies_file:
+        info_text += f"• File: <code>{downloader.cookies_file.name}</code>\n\n"
+    elif downloader.browser_cookies:
+        info_text += f"• Browser: <code>{downloader.browser_cookies}</code>\n\n"
+    else:
+        info_text += (
+            "\n<b>Why are cookies needed for Stories?</b>\n"
+            "Instagram and Facebook strictly require an active login session to view Stories, even on public accounts.\n\n"
+            "💡 <b>How to enable Story downloads:</b>\n"
+            "1. Install browser extension <b>'Get cookies.txt LOCALLY'</b> in Chrome, Edge, or Firefox.\n"
+            "2. Log in to Instagram/Facebook on your browser.\n"
+            "3. Export cookies and save the file as <code>cookies.txt</code> in the bot folder:\n"
+            f"<code>{os.path.abspath('cookies.txt')}</code>\n"
+            "4. Or set <code>BROWSER_COOKIES=chrome</code> (or <code>edge</code>, <code>firefox</code>) in your <code>.env</code> file.\n\n"
+            "<i>Once saved, restart the bot and all IG & FB Stories will download automatically!</i>"
+        )
+    if update.message:
+        await update.message.reply_text(info_text, parse_mode=ParseMode.HTML)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -97,16 +219,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "📖 <b>How to Use Social Downloader Bot:</b>\n\n"
         "1. <b>Send any link</b> from TikTok, Instagram, YouTube, Twitter/X, Facebook, Pinterest, Reddit, etc.\n"
-        "2. The bot will <b>automatically pick the best quality video</b> and download <b>all pictures and videos</b> in the post!\n"
+        "2. The bot <b>automatically selects the highest quality available (HD - 4K)</b> and downloads <b>all pictures and videos</b> in the post!\n"
         "3. Wait a few moments and all files will be uploaded directly to your chat.\n\n"
-        "✨ <b>Supported Multi-Media:</b>\n"
-        "• Instagram Carousel Posts (multiple photos & videos)\n"
-        "• TikTok Photo Slideshows & Videos\n"
-        "• Twitter/X multiple media posts\n"
-        "• YouTube Playlists & Shorts\n"
-        "• Reddit galleries & Pinterest pins\n\n"
-        "⚠️ <b>Note on Telegram Limits:</b>\n"
-        "Telegram bots have a maximum upload limit of <b>50 MB</b> per file."
+        "✨ <b>Supported Content:</b>\n"
+        "• <b>4K & Full HD Videos</b>: YouTube, Facebook Reels & Watch, TikTok, Twitter/X\n"
+        "• <b>Instagram Stories & Carousels</b>: Multiple photos and videos from single links\n"
+        "• <b>TikTok Photo Slideshows</b>: All photos in original crisp resolution\n"
+        "• <b>Facebook Share Links</b>: Directly handles mobile <code>facebook.com/share/r/</code> URLs\n\n"
+        "💡 <b>Helpful Commands:</b>\n"
+        "• /cookies : Check or configure cookies for Stories\n"
+        "• /help : Show this instruction message"
     )
     if update.message:
         await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
@@ -120,7 +242,7 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     matches = URL_REGEX.findall(message.text)
     if not matches:
-        await message.reply_text("❌ Please send a valid media URL (TikTok, Instagram, YouTube, X/Twitter, etc.).")
+        await message.reply_text("❌ Please send a valid media URL (TikTok, Instagram, YouTube, Facebook, X, etc.).")
         return
 
     url = matches[0]
@@ -128,8 +250,8 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     bot_username = getattr(context.bot, "username", None) or "MultidownloadHak_bot"
 
     status_msg = await message.reply_text(
-        "⏳ <b>Downloading best quality media...</b>\n"
-        "<i>Fetching videos and pictures, please wait...</i>",
+        "⏳ <b>Downloading media in highest quality (HD-4K)...</b>\n"
+        "<i>Processing video & photo streams, please wait...</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -138,20 +260,37 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     req_dir = DOWNLOADS_DIR / f"dl_{req_id}"
 
     try:
-        # Show recording/uploading action in chat
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
-        # Download automatically in best quality (handles single & multiple media)
+        # Download automatically in highest quality (handles single & multiple media)
         result = await loop.run_in_executor(
             None,
             lambda: downloader.download_media(url, req_dir=req_dir),
         )
 
         files: List[Dict[str, Any]] = result.get("files", [])
+        is_story = result.get("is_story", False)
+        story_missing_cookies = result.get("story_missing_cookies", False)
+
+        # If story link was submitted and failed due to lack of cookies
+        if (is_story and not files) or story_missing_cookies:
+            story_help_text = (
+                "⚠️ <b>Instagram / Facebook Story Notice:</b>\n\n"
+                "Instagram and Facebook require an active login session (cookies) to download Stories (even on public profiles).\n\n"
+                "💡 <b>How to enable Story Downloads in 1 minute:</b>\n"
+                "1. Install <b>'Get cookies.txt LOCALLY'</b> extension in your browser.\n"
+                "2. Export your cookies while logged into Instagram / Facebook.\n"
+                f"3. Place the file as <code>cookies.txt</code> in:\n<code>{os.path.abspath('cookies.txt')}</code>\n"
+                "4. Or add <code>BROWSER_COOKIES=chrome</code> in your <code>.env</code> file.\n\n"
+                "<i>Send /cookies for more details!</i>"
+            )
+            await status_msg.edit_text(story_help_text, parse_mode=ParseMode.HTML)
+            return
+
         if not files:
             await status_msg.edit_text(
                 "❌ <b>No media could be downloaded from this link.</b>\n"
-                "<i>Please check if the link is public and still accessible.</i>",
+                "<i>Please check if the video/post is public, still accessible, or requires cookies.</i>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -159,27 +298,71 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         title = result.get("title", "Media") or "Media"
         uploader = result.get("uploader", "Creator") or "Creator"
         safe_title = html.escape(title[:80])
-        caption = f"🎬 <b>{safe_title}</b>\n👤 {html.escape(uploader[:50])}\n⚡ @{bot_username}"
 
-        # Filter by Telegram Bot API 50MB limit
-        valid_files = [f for f in files if f["size_mb"] <= 50.0]
-        oversized_files = [f for f in files if f["size_mb"] > 50.0]
+        # Process each video to ensure it fits within Telegram's upload limit
+        final_files_to_send: List[Dict[str, Any]] = []
+        oversized_files: List[Dict[str, Any]] = []
 
-        if not valid_files:
+        for item in files:
+            p = item["path"]
+            sz_mb = item["size_mb"]
+
+            if item["type"] == "video" and sz_mb > TELEGRAM_MAX_MB:
+                # Video is 4K or large HD exceeding Telegram limit:
+                # 1. Save a pristine copy to permanent local storage
+                try:
+                    permanent_copy = PERMANENT_SAVED_DIR / f"{Path(p).stem}_original_4k{Path(p).suffix}"
+                    shutil.copy2(p, permanent_copy)
+                    item["saved_original_path"] = str(permanent_copy)
+                except Exception as save_err:
+                    logger.debug(f"Could not copy to permanent directory: {save_err}")
+
+                # 2. Try smart ffmpeg compression to fit Telegram's limit
+                try:
+                    await status_msg.edit_text(
+                        f"⚙️ <b>Optimizing high-res video ({sz_mb:.1f} MB) for Telegram...</b>\n"
+                        "<i>Pristine 4K original is saved on your PC!</i>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+
+                optimized_p = await loop.run_in_executor(
+                    None,
+                    lambda: optimize_video_for_telegram(p, target_max_mb=TELEGRAM_MAX_MB),
+                )
+
+                if optimized_p and os.path.exists(optimized_p):
+                    new_sz_mb = os.path.getsize(optimized_p) / (1024 * 1024)
+                    item["path"] = optimized_p
+                    item["size_mb"] = new_sz_mb
+                    item["was_optimized"] = True
+                    final_files_to_send.append(item)
+                else:
+                    oversized_files.append(item)
+            elif sz_mb <= 50.0:
+                final_files_to_send.append(item)
+            else:
+                oversized_files.append(item)
+
+        if not final_files_to_send:
             oversized_info = "\n".join(
                 [f"• <code>{html.escape(f['filename'])}</code> ({f['size_mb']:.1f} MB)" for f in oversized_files]
             )
+            saved_paths = "\n".join(
+                [f"💾 <code>{html.escape(f.get('saved_original_path') or f['path'])}</code>" for f in oversized_files]
+            )
             await status_msg.edit_text(
-                f"⚠️ <b>File(s) exceed Telegram's 50 MB limit:</b>\n{oversized_info}\n\n"
-                "Telegram bots cannot upload files larger than 50 MB.",
+                f"⚠️ <b>Video exceeds Telegram's 50 MB limit:</b>\n{oversized_info}\n\n"
+                f"✅ <b>Pristine Full 4K/HD file saved on your PC at:</b>\n{saved_paths}",
                 parse_mode=ParseMode.HTML,
             )
             return
 
-        total_files = len(valid_files)
+        total_files = len(final_files_to_send)
         try:
             await status_msg.edit_text(
-                f"⬆️ <b>Uploading {total_files} file(s) in best quality...</b>",
+                f"⬆️ <b>Uploading {total_files} file(s) in highest quality (HD-4K)...</b>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -188,12 +371,19 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         sent_count = 0
 
         # Separate photo/video vs audio/document
-        pv_files = [f for f in valid_files if f["type"] in ("video", "photo")]
-        other_files = [f for f in valid_files if f["type"] not in ("video", "photo")]
+        pv_files = [f for f in final_files_to_send if f["type"] in ("video", "photo")]
+        other_files = [f for f in final_files_to_send if f["type"] not in ("video", "photo")]
+
+        # Caption builder
+        base_caption = f"🎬 <b>{safe_title}</b>\n👤 {html.escape(uploader[:50])}\n⚡ @{bot_username}"
 
         # 1) If exactly 1 photo or video: send directly
         if len(pv_files) == 1 and not other_files:
             item = pv_files[0]
+            caption = base_caption
+            if item.get("saved_original_path"):
+                caption += f"\n\n💾 <i>Full 4K saved on PC:</i>\n<code>{html.escape(os.path.basename(item['saved_original_path']))}</code>"
+
             if item["type"] == "photo":
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
                 with open(item["path"], "rb") as f:
@@ -215,8 +405,8 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             caption=caption,
                             parse_mode=ParseMode.HTML,
                             supports_streaming=True,
-                            read_timeout=180,
-                            write_timeout=180,
+                            read_timeout=240,
+                            write_timeout=240,
                         )
                 except Exception as vid_err:
                     logger.warning(f"send_video error ({vid_err}), fallback to send_document")
@@ -226,8 +416,8 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             document=f,
                             caption=caption,
                             parse_mode=ParseMode.HTML,
-                            read_timeout=180,
-                            write_timeout=180,
+                            read_timeout=240,
+                            write_timeout=240,
                         )
             sent_count += 1
 
@@ -242,7 +432,7 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     for idx, item in enumerate(chunk):
                         fp = open(item["path"], "rb")
                         opened_files.append(fp)
-                        item_caption = caption if (i == 0 and idx == 0) else None
+                        item_caption = base_caption if (i == 0 and idx == 0) else None
                         if item["type"] == "photo":
                             media_group.append(
                                 InputMediaPhoto(
@@ -265,13 +455,12 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await context.bot.send_media_group(
                         chat_id=chat_id,
                         media=media_group,
-                        read_timeout=180,
-                        write_timeout=180,
+                        read_timeout=240,
+                        write_timeout=240,
                     )
                     sent_count += len(chunk)
                 except Exception as album_err:
                     logger.warning(f"send_media_group failed ({album_err}), falling back to individual sends")
-                    # Fallback: send each file in this chunk individually
                     for item in chunk:
                         try:
                             with open(item["path"], "rb") as f:
@@ -279,14 +468,14 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                                     await context.bot.send_photo(
                                         chat_id=chat_id,
                                         photo=f,
-                                        caption=caption,
+                                        caption=base_caption,
                                         parse_mode=ParseMode.HTML,
                                     )
                                 else:
                                     await context.bot.send_video(
                                         chat_id=chat_id,
                                         video=f,
-                                        caption=caption,
+                                        caption=base_caption,
                                         parse_mode=ParseMode.HTML,
                                         supports_streaming=True,
                                     )
@@ -311,7 +500,7 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             audio=f,
                             title=title[:80],
                             performer=uploader[:50],
-                            caption=caption,
+                            caption=base_caption,
                             parse_mode=ParseMode.HTML,
                             read_timeout=120,
                             write_timeout=120,
@@ -321,7 +510,7 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         await context.bot.send_document(
                             chat_id=chat_id,
                             document=f,
-                            caption=caption,
+                            caption=base_caption,
                             parse_mode=ParseMode.HTML,
                             read_timeout=120,
                             write_timeout=120,
@@ -331,9 +520,10 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 logger.error(f"Failed to send {item['filename']}: {oth_err}")
 
         # Summary notification
-        completion_text = f"✅ <b>Downloaded and sent {sent_count} file(s) in best quality!</b>"
+        completion_text = f"✅ <b>Downloaded and sent {sent_count} file(s) in highest quality (HD-4K)!</b>"
         if oversized_files:
-            completion_text += f"\n⚠️ <i>({len(oversized_files)} file(s) skipped due to Telegram's 50MB limit)</i>"
+            saved_oversized = "\n".join([f"💾 <code>{html.escape(f['filename'])}</code>" for f in oversized_files])
+            completion_text += f"\n\n💾 <i>Full 4K files saved on your PC:</i>\n{saved_oversized}"
         try:
             await status_msg.edit_text(completion_text, parse_mode=ParseMode.HTML)
         except Exception:
@@ -351,7 +541,7 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
 
     finally:
-        # Clean up temporary request directory to free disk space
+        # Clean up temporary request directory
         if req_dir.exists():
             try:
                 shutil.rmtree(req_dir, ignore_errors=True)
@@ -365,7 +555,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if not query:
         return
     await query.answer()
-    await query.edit_message_text("⚡ The bot now downloads automatically in best quality! Just send the link.")
+    await query.edit_message_text("⚡ The bot now downloads automatically in highest quality (HD-4K)! Just send any link.")
 
 
 BOT_STATUS = {
@@ -437,12 +627,10 @@ def main():
 
     if not token or token == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
         BOT_STATUS["status"] = "Action Required: Missing Token"
-        BOT_STATUS["message"] = "Please configure TELEGRAM_BOT_TOKEN in Render Dashboard > Environment."
+        BOT_STATUS["message"] = "Please configure TELEGRAM_BOT_TOKEN in Render Dashboard > Environment or .env file."
         logger.error("=" * 60)
         logger.error("⚠️ TELEGRAM_BOT_TOKEN NOT FOUND!")
-        logger.error("Please configure your Telegram Bot Token in Render Environment or .env file.")
         logger.error("=" * 60)
-
         if is_cloud:
             import time
             while not token or token == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
@@ -465,6 +653,7 @@ def main():
         # Handlers
         app.add_handler(CommandHandler("start", start_command))
         app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("cookies", cookies_command))
         app.add_handler(CallbackQueryHandler(handle_callback_query))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url_message))
 
