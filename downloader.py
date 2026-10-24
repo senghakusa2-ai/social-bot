@@ -293,36 +293,36 @@ class SocialDownloader:
             except Exception as story_err:
                 logger.debug(f"Story extraction via gallery-dl notice: {story_err}")
 
-        # Strategy 3: Download with yt-dlp with HIGHEST QUALITY (HD - 4K Priority)
+        # Strategy 3: Download with yt-dlp with ABSOLUTE HIGHEST QUALITY (HD - 4K Priority)
         opts = self._get_base_opts()
         output_template = str(req_dir / "%(autonumber)02d_%(title).60s_%(id)s.%(ext)s")
         opts.update({
             "outtmpl": output_template,
-            # Prioritize 4K (2160p) -> 2K (1440p) -> Full HD (1080p) -> 720p HD
+            # Download the absolute best video+audio streams (no height cap)
             "format": "bestvideo*+bestaudio/best",
+            # Sort: prefer highest resolution, then highest bitrate, then biggest filesize
+            # Do NOT prefer h264 — VP9/AV1 give better quality at the same bitrate
             "format_sort": [
-                "res:2160",
-                "res:1440",
-                "res:1080",
-                "res:720",
                 "res",
-                "fps",
-                "codec:h264",
-                "quality",
-                "size",
                 "br",
+                "size",
+                "fps",
+                "vcodec:vp9.2",
+                "acodec:opus",
             ],
+            "format_sort_force": True,
             "merge_output_format": "mp4",
             "noplaylist": False,
             "ignoreerrors": True,
             "max_downloads": max_items,
+            # Remux into MP4 container with faststart for streaming
             "postprocessors": [{
-                "key": "FFmpegVideoRemuxer",
+                "key": "FFmpegVideoConvertor",
                 "preferedformat": "mp4",
             }],
-            "postprocessor_args": [
-                "-movflags", "+faststart",
-            ],
+            "postprocessor_args": {
+                "FFmpegVideoConvertor": ["-movflags", "+faststart"],
+            },
         })
         if progress_hook:
             opts["progress_hooks"] = [progress_hook]
@@ -475,17 +475,20 @@ class SocialDownloader:
             q = quality.lower().split()[0]
             if q == "4k":
                 opts["format"] = "bestvideo*[height<=2160]+bestaudio/best[height<=2160]/bestvideo*+bestaudio/best"
-                opts["format_sort"] = ["res:2160", "res:1440", "res:1080", "res", "fps"]
+                opts["format_sort"] = ["res", "br", "size", "fps"]
+                opts["format_sort_force"] = True
             elif q == "1080p":
                 opts["format"] = "bestvideo*[height<=1080]+bestaudio/best[height<=1080]/bestvideo*+bestaudio/best"
-                opts["format_sort"] = ["res:1080", "res:720", "res", "fps"]
+                opts["format_sort"] = ["res", "br", "size", "fps"]
+                opts["format_sort_force"] = True
             elif q == "720p":
                 opts["format"] = "bestvideo*[height<=720]+bestaudio/best[height<=720]/bestvideo*+bestaudio/best"
             elif q == "480p":
                 opts["format"] = "bestvideo*[height<=480]+bestaudio/best[height<=480]/bestvideo*+bestaudio/best"
             else:
                 opts["format"] = "bestvideo*+bestaudio/best"
-                opts["format_sort"] = ["res:2160", "res:1440", "res:1080", "res", "fps"]
+                opts["format_sort"] = ["res", "br", "size", "fps"]
+                opts["format_sort_force"] = True
 
             opts["merge_output_format"] = "mp4"
 

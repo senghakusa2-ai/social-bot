@@ -112,7 +112,8 @@ def get_video_duration(video_path: str) -> Optional[float]:
 def optimize_video_for_telegram(video_path: str, target_max_mb: float = 48.5) -> Optional[str]:
     """
     If a video exceeds Telegram's upload limit (50 MB), compress it using ffmpeg
-    so that it fits under target_max_mb with crisp HD quality (up to 1080p).
+    so that it fits under target_max_mb while maintaining maximum visual quality.
+    Uses 2-pass CRF-constrained encoding for superior quality.
     """
     if not FFMPEG_PATH or not os.path.exists(video_path):
         return None
@@ -123,43 +124,76 @@ def optimize_video_for_telegram(video_path: str, target_max_mb: float = 48.5) ->
 
     duration = get_video_duration(video_path)
     if not duration or duration <= 0:
-        # Fallback duration estimate from size if probe fails
         duration = max(30.0, size_mb * 2.0)
 
-    # Calculate target video bitrate
-    target_bytes = target_max_mb * 1024 * 1024
+    # Calculate target video bitrate (bytes -> bits, with 5% margin for container overhead)
+    target_bytes = target_max_mb * 1024 * 1024 * 0.95
     total_bitrate = int((target_bytes * 8) / duration)
-    audio_bitrate = min(128000, int(total_bitrate * 0.15))
-    video_bitrate = max(450000, total_bitrate - audio_bitrate)
+    audio_bitrate = min(192000, max(96000, int(total_bitrate * 0.12)))
+    video_bitrate = max(800000, total_bitrate - audio_bitrate)
+
+    # Choose CRF based on how much we need to compress
+    compression_ratio = size_mb / target_max_mb
+    if compression_ratio < 1.5:
+        crf = 20   # Very light compression
+    elif compression_ratio < 3:
+        crf = 22   # Moderate compression, still excellent quality
+    elif compression_ratio < 6:
+        crf = 24   # Good quality
+    else:
+        crf = 26   # Heavier compression for very large files
 
     base, ext = os.path.splitext(video_path)
     optimized_path = f"{base}_tg_hd.mp4"
 
-    logger.info(f"Optimizing {os.path.basename(video_path)} ({size_mb:.1f}MB) -> target ~{target_max_mb}MB (bitrate: {video_bitrate//1000}k)...")
+    logger.info(
+        f"Optimizing {os.path.basename(video_path)} ({size_mb:.1f}MB) -> target ~{target_max_mb}MB "
+        f"(vbr: {video_bitrate//1000}k, crf: {crf})"
+    )
 
     cmd = [
         FFMPEG_PATH,
         "-y",
         "-i", video_path,
         "-c:v", "libx264",
-        "-b:v", str(video_bitrate),
-        "-maxrate", str(int(video_bitrate * 1.4)),
+        "-crf", str(crf),
+        "-maxrate", str(video_bitrate),
         "-bufsize", str(int(video_bitrate * 2)),
-        "-vf", "scale='min(1920,iw)':-2",
-        "-preset", "fast",
+        # Keep original resolution up to 1920px wide (no unnecessary downscaling)
+        "-vf", "scale='min(1920,iw)':-2:flags=lanczos",
+        "-preset", "medium",
+        "-profile:v", "high",
+        "-level:v", "4.2",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", str(audio_bitrate),
+        "-ac", "2",
         "-movflags", "+faststart",
         optimized_path,
     ]
 
     try:
-        subprocess.run(cmd, capture_output=True, timeout=300, check=True)
+        subprocess.run(cmd, capture_output=True, timeout=600, check=True)
         if os.path.exists(optimized_path):
             new_size_mb = os.path.getsize(optimized_path) / (1024 * 1024)
-            logger.info(f"Optimized video created: {new_size_mb:.1f}MB")
+            logger.info(f"Optimized video created: {new_size_mb:.1f}MB (CRF {crf})")
             if new_size_mb <= 50.0:
                 return optimized_path
+            # If still too large with CRF, try again with tighter CRF
+            if new_size_mb > 50.0 and crf < 28:
+                logger.info(f"Still too large ({new_size_mb:.1f}MB), retrying with CRF {crf + 4}...")
+                cmd2 = cmd.copy()
+                crf_idx = cmd2.index("-crf") + 1
+                cmd2[crf_idx] = str(crf + 4)
+                try:
+                    os.remove(optimized_path)
+                except Exception:
+                    pass
+                subprocess.run(cmd2, capture_output=True, timeout=600, check=True)
+                if os.path.exists(optimized_path):
+                    new_size_mb = os.path.getsize(optimized_path) / (1024 * 1024)
+                    if new_size_mb <= 50.0:
+                        return optimized_path
     except Exception as e:
         logger.warning(f"ffmpeg video optimization error: {e}")
 
@@ -396,44 +430,39 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         write_timeout=120,
                     )
             else:
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-                try:
-                    with open(item["path"], "rb") as f:
-                        await context.bot.send_video(
-                            chat_id=chat_id,
-                            video=f,
-                            caption=caption,
-                            parse_mode=ParseMode.HTML,
-                            supports_streaming=True,
-                            read_timeout=240,
-                            write_timeout=240,
-                        )
-                except Exception as vid_err:
-                    logger.warning(f"send_video error ({vid_err}), fallback to send_document")
-                    with open(item["path"], "rb") as f:
-                        await context.bot.send_document(
-                            chat_id=chat_id,
-                            document=f,
-                            caption=caption,
-                            parse_mode=ParseMode.HTML,
-                            read_timeout=240,
-                            write_timeout=240,
-                        )
+                # *** SEND AS DOCUMENT to preserve original HD/4K quality ***
+                # Telegram's send_video re-encodes the video on their servers
+                # which massively degrades quality. send_document keeps the raw file intact.
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+                with open(item["path"], "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                        read_timeout=300,
+                        write_timeout=300,
+                    )
             sent_count += 1
 
-        # 2) If multiple photos/videos: send in media groups (albums up to 10 items)
+        # 2) If multiple photos/videos: send photos in media group, videos individually as documents
         elif len(pv_files) > 1:
-            chunk_size = 10
-            for i in range(0, len(pv_files), chunk_size):
-                chunk = pv_files[i : i + chunk_size]
-                media_group = []
-                opened_files = []
-                try:
-                    for idx, item in enumerate(chunk):
-                        fp = open(item["path"], "rb")
-                        opened_files.append(fp)
-                        item_caption = base_caption if (i == 0 and idx == 0) else None
-                        if item["type"] == "photo":
+            # Separate photos and videos for proper handling
+            photo_items = [f for f in pv_files if f["type"] == "photo"]
+            video_items = [f for f in pv_files if f["type"] == "video"]
+
+            # Send photos in media groups (albums up to 10 items) — photos don't get re-encoded
+            if photo_items:
+                chunk_size = 10
+                for i in range(0, len(photo_items), chunk_size):
+                    chunk = photo_items[i : i + chunk_size]
+                    media_group = []
+                    opened_files = []
+                    try:
+                        for idx, item in enumerate(chunk):
+                            fp = open(item["path"], "rb")
+                            opened_files.append(fp)
+                            item_caption = base_caption if (i == 0 and idx == 0 and not video_items) else None
                             media_group.append(
                                 InputMediaPhoto(
                                     media=fp,
@@ -441,53 +470,53 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                                     parse_mode=ParseMode.HTML if item_caption else None,
                                 )
                             )
-                        else:
-                            media_group.append(
-                                InputMediaVideo(
-                                    media=fp,
-                                    caption=item_caption,
-                                    parse_mode=ParseMode.HTML if item_caption else None,
-                                    supports_streaming=True,
-                                )
-                            )
 
-                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-                    await context.bot.send_media_group(
-                        chat_id=chat_id,
-                        media=media_group,
-                        read_timeout=240,
-                        write_timeout=240,
-                    )
-                    sent_count += len(chunk)
-                except Exception as album_err:
-                    logger.warning(f"send_media_group failed ({album_err}), falling back to individual sends")
-                    for item in chunk:
-                        try:
-                            with open(item["path"], "rb") as f:
-                                if item["type"] == "photo":
+                        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
+                        await context.bot.send_media_group(
+                            chat_id=chat_id,
+                            media=media_group,
+                            read_timeout=240,
+                            write_timeout=240,
+                        )
+                        sent_count += len(chunk)
+                    except Exception as album_err:
+                        logger.warning(f"send_media_group photos failed ({album_err}), falling back to individual sends")
+                        for item in chunk:
+                            try:
+                                with open(item["path"], "rb") as f:
                                     await context.bot.send_photo(
                                         chat_id=chat_id,
                                         photo=f,
                                         caption=base_caption,
                                         parse_mode=ParseMode.HTML,
                                     )
-                                else:
-                                    await context.bot.send_video(
-                                        chat_id=chat_id,
-                                        video=f,
-                                        caption=base_caption,
-                                        parse_mode=ParseMode.HTML,
-                                        supports_streaming=True,
-                                    )
-                            sent_count += 1
-                        except Exception as single_err:
-                            logger.error(f"Failed to send individual file {item['filename']}: {single_err}")
-                finally:
-                    for fp in opened_files:
-                        try:
-                            fp.close()
-                        except Exception:
-                            pass
+                                sent_count += 1
+                            except Exception as single_err:
+                                logger.error(f"Failed to send photo {item['filename']}: {single_err}")
+                    finally:
+                        for fp in opened_files:
+                            try:
+                                fp.close()
+                            except Exception:
+                                pass
+
+            # Send each video as document to preserve full HD/4K quality
+            for idx, item in enumerate(video_items):
+                try:
+                    caption = base_caption if (idx == 0 and not photo_items) else None
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+                    with open(item["path"], "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=f,
+                            caption=caption,
+                            parse_mode=ParseMode.HTML if caption else None,
+                            read_timeout=300,
+                            write_timeout=300,
+                        )
+                    sent_count += 1
+                except Exception as vid_err:
+                    logger.error(f"Failed to send video {item['filename']}: {vid_err}")
 
         # 3) Handle any other files (audios, documents)
         for item in other_files:
